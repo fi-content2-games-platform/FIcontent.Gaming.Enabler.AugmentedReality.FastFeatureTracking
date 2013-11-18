@@ -1,4 +1,4 @@
-Augmented Reality - Fast Feature Tracking
+Fast Feature Tracking
 =============================================================
 This repository will contain the following Augmented Reality SEs of the FIcontent Pervasive Games Platform:
   * FastFeatureTracking SE 
