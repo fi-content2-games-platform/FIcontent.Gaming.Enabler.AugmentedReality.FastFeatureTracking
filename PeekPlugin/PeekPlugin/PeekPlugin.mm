@@ -1,0 +1,591 @@
+//
+//  PeekPlugin.m
+//
+//  Copyright (c) 2012 Disney Research. All rights reserved.
+//
+// Get camera feed from iphone natively, this is a lot faster
+// Plus do some computations that are better done here for speed/simplicity
+
+#import <AssertMacros.h>
+#import <UIKit/UIKit.h>
+#import <UIKit/UIApplication.h>
+#import <UIKit/UIImage.h>
+#import <ImageIO/ImageIO.h>
+
+#import <AVFoundation/AVFoundation.h>
+#import <CoreFoundation/CFData.h>
+
+#import "PeekPlugin.h"
+
+#include "PeekProcess.h"
+
+dispatch_semaphore_t frameRenderingSemaphore;
+dispatch_queue_t videoQueue;
+
+const int radius=4;
+const int diameter=radius<<1;
+float averageCenterColorR=0;
+float averageCenterColorG=0;
+float averageCenterColorB=0;
+
+AVCaptureVideoDataOutput *videoOutput = nil;
+AVCaptureDevice * device = nil;
+UIImage* theImage = nil;
+bool bPhotoDone = false;
+bool bEnableColorSamples=false;
+
+UIPopoverController* galleryPopover = nil;
+UIImagePickerController *imagePicker = nil;
+
+// Utility routine to display error aleart if takePicture fails
+void displayErrorOnMainQueue(NSError* error, NSString* message)
+{
+    debug_string(message.UTF8String);
+    
+	dispatch_async(dispatch_get_main_queue(), ^(void) {
+		UIAlertView *alertView = [[UIAlertView alloc] initWithTitle:[NSString stringWithFormat:@"%@ (%d)", message, (int)[error code]]
+		message:[error localizedDescription]
+		delegate:nil
+		cancelButtonTitle:@"Dismiss"
+		otherButtonTitles:nil];
+		[alertView show];
+	});
+}
+
+// Converts C style string to NSString
+NSString* CreateNSString (const char* string)
+{
+	if (string)
+		return [NSString stringWithUTF8String: string];
+	else
+		return [NSString stringWithUTF8String: ""];
+}
+
+// Utility routing used during image capture to set up capture orientation
+AVCaptureVideoOrientation avOrientationForDeviceOrientation(UIDeviceOrientation deviceOrientation)
+{
+	AVCaptureVideoOrientation result = deviceOrientation;
+	if ( deviceOrientation == UIDeviceOrientationLandscapeLeft )
+		result = AVCaptureVideoOrientationLandscapeRight;
+        else if ( deviceOrientation == UIDeviceOrientationLandscapeRight )
+            result = AVCaptureVideoOrientationLandscapeLeft;
+            return result;
+}
+
+// Writes OpenGL errors messages to the log
+void checkGL()
+{
+    GLenum err (glGetError());
+    
+    while(err!=GL_NO_ERROR)
+    {        
+        switch(err) {
+            case GL_INVALID_OPERATION:              NSLog(@"GL_INVALID_OPERATION");              break;
+            case GL_INVALID_ENUM:                   NSLog(@"GL_INVALID_ENUM");                   break;
+            case GL_INVALID_VALUE:                  NSLog(@"GL_INVALID_VALUE");                  break;
+            case GL_OUT_OF_MEMORY:                  NSLog(@"GL_OUT_OF_MEMORY");                  break;
+            case GL_INVALID_FRAMEBUFFER_OPERATION:  NSLog(@"GL_INVALID_FRAMEBUFFER_OPERATION");  break;
+        }
+        
+        err=glGetError();
+    }
+}
+
+// Computes averageCenterColorR, averageCenterColorG, and averageCenterColorB from the src image
+void CalcAverageCenterColor(uint32_t* src, int w, int h)
+{
+    int sx=(w>>1)-radius, sy=(h>>1)-radius;
+    int baseIdx = sx+w*sy;
+    float r=0, g=0, b=0;
+    for (int x=0; x<diameter; x++)
+    {
+        for (int y=0; y<diameter; y++)
+        {
+            uint32_t col=src[baseIdx+x+y*w];
+            r+=((col&0x00ff0000)>>16)/255.0f;
+            g+=((col&0x00ff00)>>8)/255.0f;
+            b+=(col&0xff)/255.0f;
+        }
+    }
+    float tot=diameter*diameter;
+    averageCenterColorR=r/tot;
+    averageCenterColorG=g/tot;
+    averageCenterColorB=b/tot;
+}
+
+// Startes the async OnVideoProcessingQueue
+void runAsynchronouslyOnVideoProcessingQueue(void (^block)(void))
+{
+    dispatch_async(videoQueue, block);
+}
+
+@implementation VideoCameraDelegate
+
+@synthesize textureId = _textureId, width = _width, height = _height;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark NSObject
+
+
+// Singleton of the VideoCameraDelegate
++ (VideoCameraDelegate*)sharedManager
+{
+	static VideoCameraDelegate *sharedManager = nil;
+	
+	if( !sharedManager )
+		sharedManager = [[VideoCameraDelegate alloc] init];
+	
+	return sharedManager;
+}
+
+// Initializes this class
+- (id)init
+{
+	// early out for no support
+	if( ![VideoCameraDelegate isCaptureAvailable] )
+		return nil;
+	
+	if( ( self = [super init] ) )
+	{
+		_textureId = -1;
+		_orientation = [UIApplication sharedApplication].statusBarOrientation;
+	}
+	return self;
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Public
+
+// Returns true if there is a video capture device available
++ (BOOL)isCaptureAvailable
+{
+	Class cls = NSClassFromString( @"AVCaptureDevice" );
+	
+	// we need a legit class and at least one device
+	return ( cls && [VideoCameraDelegate availableDevices].count );
+}
+
+// Returns true if the camera device is currently adjusting camera parameters
++ (BOOL)isCameraAdjusting
+{
+    if (device==nil) return true;
+    return device.adjustingWhiteBalance || device.adjustingExposure || device.adjustingFocus;
+}
+
+// Returns an array of AVMediaTypeVideo type capture devices
++ (NSArray*)availableDevices
+{
+	return [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+}
+
+// Starts the camera capture session
+- (void)startCameraCaptureWithDevice:(NSString*)deviceId
+{
+	if( session )
+	{
+		NSLog( @"camera capture already running" );
+		return;
+	}
+	
+	//videoQueue = dispatch_queue_create("com.disney.peekProcessingQueue", NULL);
+    //frameRenderingSemaphore = dispatch_semaphore_create(1);
+
+	// Unity created a new texture for us so change a couple settings on it
+	glBindTexture( GL_TEXTURE_2D, _textureId );
+	
+	// this is necessary for non-power-of-two textures
+	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+	   
+	// Create the AVCapture Session
+	session = [[AVCaptureSession alloc] init];
+	[session beginConfiguration];
+	
+	// Get the default camera device
+	AVCaptureDevice* device = [AVCaptureDevice deviceWithUniqueID:deviceId];
+    
+    NSError* error = nil;
+/*    if ([device lockForConfiguration:&error])
+    {
+        if ([device isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus])
+        {
+            [device setFocusMode:AVCaptureFocusModeContinuousAutoFocus];
+        }
+        
+        if ([device isFocusPointOfInterestSupported])
+        {
+            //debug_string("settting focus");
+            CGPoint point=CGPointMake(0.5f,0.5f);
+            [device setFocusPointOfInterest:point];
+        }
+        
+        if ([device isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure])
+        {
+            [device setExposureMode:AVCaptureExposureModeContinuousAutoExposure];
+            //debug_string("setting continuous exposure");
+        }
+        else if ([device isExposureModeSupported:AVCaptureExposureModeAutoExpose])
+        {
+            [device setExposureMode:AVCaptureExposureModeAutoExpose];
+            //debug_string("setting exposure");
+        }
+        
+        if ([device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeContinuousAutoWhiteBalance])
+        {
+            //debug_string("setting white balance");
+            [device setWhiteBalanceMode:AVCaptureWhiteBalanceModeContinuousAutoWhiteBalance];
+        }
+        else if ([device isWhiteBalanceModeSupported:AVCaptureWhiteBalanceModeAutoWhiteBalance])
+        {
+            //debug_string("setting continuous white balance");
+            [device setWhiteBalanceMode:AVCaptureWhiteBalanceModeAutoWhiteBalance];
+        }
+        
+        [device unlockForConfiguration];
+    }
+    else
+    {
+        NSLog(@"Error: %@", error);
+    }*/
+
+	// Create a AVCaptureInput with the camera device
+	AVCaptureDeviceInput *cameraInput = [[AVCaptureDeviceInput alloc] initWithDevice:device error:&error];
+	if( cameraInput == nil )
+	{
+		NSLog( @"Error creating camera capture: %@", [error localizedDescription] );
+		return;
+	}
+	
+	if( [session canAddInput:cameraInput] )
+		[session addInput:cameraInput];
+	
+	// Set the output
+	AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+	videoOutput.alwaysDiscardsLateVideoFrames = YES;
+
+    int frameRate = 60;
+
+    for (AVCaptureConnection *connection in videoOutput.connections)
+    {
+        if ([connection respondsToSelector:@selector(setVideoMinFrameDuration:)])
+        connection.videoMinFrameDuration = CMTimeMake(1, frameRate);
+
+        if ([connection respondsToSelector:@selector(setVideoMaxFrameDuration:)])
+        connection.videoMaxFrameDuration = CMTimeMake(1, frameRate);
+    }
+ 
+	if( [session canAddOutput:videoOutput] )
+		[session addOutput:videoOutput];
+		
+	// setup our delegate and use the main queue because we will set the texture in the callback
+	// and we need to be on the main thread
+	[videoOutput setSampleBufferDelegate:self queue:dispatch_get_main_queue()];
+	
+	// configure the pixel format (not all formats work, native is YUV but 32BGRA works)
+	videoOutput.videoSettings = [NSDictionary dictionaryWithObject:[NSNumber numberWithUnsignedInt:kCVPixelFormatType_32BGRA] forKey:(id)kCVPixelBufferPixelFormatTypeKey];
+	
+#if 0
+    // Make a video image output
+    videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+    NSArray *supportedPixelFormats = videoOutput.availableVideoCVPixelFormatTypes;
+    int chosenPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    for (NSNumber *currentPixelFormat in supportedPixelFormats)
+    {
+        if ([currentPixelFormat intValue] == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        {
+            chosenPixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+        }
+    }
+    
+    [videoOutput setVideoSettings:[NSDictionary dictionaryWithObject:[NSNumber numberWithInt:chosenPixelFormat] forKey:(id)kCVPixelBufferPixelFormatTypeKey]];
+#endif
+    
+	// and the size of the frames we want
+    [session setSessionPreset:AVCaptureSessionPreset640x480]; // 640x480 is usable, not too slow
+	
+	[session commitConfiguration];
+	
+	// Start the session
+	[session startRunning];
+    
+    if (![session isRunning]) NSLog(@"sesion isn't running!?!", nil);
+}
+
+// Is called for each frame of video, using GL api to transfer from video output buffer to unity texture, this should not take too long
+- (void) didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer
+{
+}
+
+// Stops the camera capture session
+- (void)stopCameraCapture
+{
+	_textureId = -1;
+	
+	[session stopRunning];
+	//[session release];
+	session = nil;
+}
+
+
+// Sets the exposure mode for AVCaptureDeviceInput if supported
+- (void)setExposureMode:(AVCaptureExposureMode)exposureMode	
+{
+	if( !session || session.inputs.count == 0 )
+		return;
+	
+	AVCaptureDeviceInput *input = [session.inputs objectAtIndex:0];
+	if( [input.device lockForConfiguration:nil] )
+	{
+		if( [input.device isExposureModeSupported:exposureMode] )
+			input.device.exposureMode = exposureMode;
+		[input.device unlockForConfiguration];
+	}
+}
+
+
+// Sets the focus mode for AVCaptureDeviceInput if supported
+- (void)setFocusMode:(AVCaptureFocusMode)focusMode
+{
+	if( !session || session.inputs.count == 0 )
+		return;
+	
+	AVCaptureDeviceInput *input = [session.inputs objectAtIndex:0];
+	if( [input.device lockForConfiguration:nil] )
+	{
+		if( [input.device isFocusModeSupported:focusMode] )
+			input.device.focusMode = focusMode;
+		[input.device unlockForConfiguration];
+	}
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark AVCaptureVideoDataOutputSampleBufferDelegate
+
+// Writes the current frame into an CVImageBufferRef
+- (void)saveScreenshot:(CVImageBufferRef)cvimgRef
+{
+	// only save the nth frame
+	static int currentFrame = 0;
+	currentFrame++;
+	
+	if( currentFrame != 200 )
+		return;
+	
+	NSLog( @"------------------ SAVING THE CURRENT FRAME -------------------" );
+	
+	// access the data
+	int width = CVPixelBufferGetWidth( cvimgRef );
+	int height = CVPixelBufferGetHeight( cvimgRef );
+	
+	// get the raw image bytes
+	uint8_t *buf = (uint8_t*)CVPixelBufferGetBaseAddress( cvimgRef );
+	size_t bprow = CVPixelBufferGetBytesPerRow( cvimgRef );
+	
+	// turn it into something useful
+	CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+	CGContextRef context = CGBitmapContextCreate( buf, width, height, 8, bprow, colorSpace, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst );
+	
+	CGImageRef image = CGBitmapContextCreateImage( context );
+	CGContextRelease( context );
+	CGColorSpaceRelease( colorSpace );
+	
+	UIImageWriteToSavedPhotosAlbum( [UIImage imageWithCGImage:image], nil, nil, nil );
+	CGImageRelease( image );
+}
+
+// Captures the output
+- (void)captureOutput:(AVCaptureOutput*)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection*)connection
+{
+    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription( sampleBuffer );
+    CMVideoDimensions videoDimensions = CMVideoFormatDescriptionGetDimensions( formatDesc );
+
+    CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer( sampleBuffer );
+    CVPixelBufferLockBaseAddress( pixelBuffer, 0 );
+
+    // Get a image buffer holding video frame
+
+    // Get information about the image
+    uint8_t *baseAddress = (uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer);
+    if (!baseAddress) return;
+
+	glBindTexture( GL_TEXTURE_2D, _textureId );
+	checkGL();
+    
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, videoDimensions.width, videoDimensions.height,0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, baseAddress);
+//	glTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, videoDimensions.width, videoDimensions.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, baseAddress );
+    checkGL();
+    
+    if (bEnableColorSamples)
+    {
+        CalcAverageCenterColor((uint32_t*)baseAddress, videoDimensions.width, videoDimensions.height);
+    }
+	
+	CVPixelBufferUnlockBaseAddress( pixelBuffer, 0 );
+
+#if ASYNC_QUEUE
+    if (dispatch_semaphore_wait(frameRenderingSemaphore, DISPATCH_TIME_NOW) != 0)
+    {
+        return;
+    }
+    
+    CFRetain(sampleBuffer);
+    runAsynchronouslyOnVideoProcessingQueue(^{ // convert BGRA to gray scale
+       
+        size_t width = CVPixelBufferGetWidth(pixelBuffer);
+        size_t height = CVPixelBufferGetHeight(pixelBuffer);
+        size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+        size_t dataSize = CVPixelBufferGetDataSize(pixelBuffer);
+        
+        if (width==0 || height==0) return;
+        
+        CVPixelBufferLockBaseAddress( pixelBuffer, 0 );
+
+        // convert BGRA to gray
+        int numPixels=(width*height);
+        
+        //memset(baseAddress,255,dataSize);
+        //memset(_grayBuffer,255,1280*720);
+        
+        BGRAtoGray(_grayBuffer,baseAddress,numPixels);
+        
+        int circles=FindSpheres(_grayBuffer,width,height);
+        
+       // NSLog(@"Circles %i", (int)circles);
+
+
+        // actual pixel buffer size debug
+        if( NO )
+        {
+            NSLog( @"pixel buffer width: %d, height: %d", (int)width, (int)height );
+        }
+
+        CVPixelBufferUnlockBaseAddress( pixelBuffer, 0 );
+
+        CFRelease(sampleBuffer);
+        dispatch_semaphore_signal(frameRenderingSemaphore);
+    });
+#endif // ASYNC_QUEUE
+}
+
+@end
+
+// Interfaces to unity
+extern "C"
+{
+    // Saves the image to the iOS photo album
+    void _SaveImageToGallery(const char* filename)
+    {
+        UIImage* image = [UIImage imageWithContentsOfFile:CreateNSString(filename)];
+        
+        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil);
+        
+    };
+    
+    // Returns true if the camera device is currently adjusting
+    bool _IsCameraAdjusting()
+    {
+        //debug_string("IsCameraAdjusting");
+        return [VideoCameraDelegate isCameraAdjusting];
+    }
+
+    // Sets the camera exposure mode
+    void _peekSetExposureMode(int exposureMode)
+    {
+        [[VideoCameraDelegate sharedManager] setExposureMode:exposureMode];
+    }
+        
+    // Sets the camera focus mode
+    void _peekSetFocusMode( int focusMode )
+    {
+        [[VideoCameraDelegate sharedManager] setFocusMode:focusMode];
+    }
+    
+    // Returns true if the photo is done
+    bool _IsPhotoDone()
+    {
+        //debug_string("IsPhotoDone");
+        return bPhotoDone;
+    }
+    
+    // Starts the camera capture
+    void _peekStart( bool useFrontCameraIfAvailable, int textureId )
+    {
+       // NSError *error = nil;
+        bPhotoDone=false;
+        
+        NSArray *devices = [VideoCameraDelegate availableDevices];
+        NSString *deviceId;
+        
+        // Locate our deviceId
+        for( AVCaptureDevice *device in devices )
+        {
+            // do we just want the standard camera or the front?
+            if( useFrontCameraIfAvailable && device.position == AVCaptureDevicePositionFront )
+            {
+                deviceId = device.uniqueID;
+                break;
+            }
+            else if( device.position == AVCaptureDevicePositionBack )
+                deviceId = device.uniqueID;
+        }
+        
+        if( !deviceId )
+            return;
+        
+        [VideoCameraDelegate sharedManager].textureId = (GLuint)textureId;
+        [[VideoCameraDelegate sharedManager] startCameraCaptureWithDevice:deviceId];
+    }
+    
+    // Reads pixels from GL texture
+    void _peekReadPixels(int dstTexId, int srcTexId, int width, int height, float* data)
+    {
+        //NSLog(@"peeking");
+        glBindTexture( GL_TEXTURE_2D, srcTexId );
+        glReadPixels(0, 0, width, height, GL_RG_EXT, GL_HALF_FLOAT_OES, data);
+        checkGL();
+        //NSLog(@"peeked");
+    }
+
+    // Stops camera capture
+    void _peekEnd()
+    {
+        [[VideoCameraDelegate sharedManager] stopCameraCapture];
+    }
+    
+    // Converts half to float
+    float _peekHalf2Float(short x)
+    {
+        __fp16 half = *(__fp16*)&x;
+      //  if (x) NSLog(@"x:%d half:%f",x,(float)half);
+        return (float)half;
+    }
+    
+	// Set mode for averaging color sample pixels (slows down, so you can choose to do this only when needed)
+    void _peekEnableSamples(bool shouldSample)
+    {
+        bEnableColorSamples=shouldSample;
+    }
+
+    // Returns the averageCenterColorR
+    float _peekAverageR(int x, int y)
+    {
+        return averageCenterColorR;
+    }
+    
+    // Returns the averageCenterColorG
+    float _peekAverageG(int x, int y)
+    {
+        return averageCenterColorG;
+    }
+
+    // Returns the averageCenterColorB
+    float _peekAverageB(int x, int y)
+    {
+        return averageCenterColorB;
+    }
+};
+
